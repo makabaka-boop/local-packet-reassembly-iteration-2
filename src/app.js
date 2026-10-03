@@ -38,6 +38,7 @@
     gapsView: el('gapsView'),
     conflictsView: el('conflictsView'),
     textView: el('textView'),
+    httpView: el('httpView'),
     hexView: el('hexView'),
     hexCapNote: el('hexCapNote'),
     anomaliesView: el('anomaliesView'),
@@ -260,7 +261,7 @@
     ui.connNote.classList.add('hidden');
     ui.connNote.textContent = '';
     ui.packetsBody.innerHTML = '';
-    ['gapsView', 'conflictsView', 'anomaliesView'].forEach((v) => (el(v).innerHTML = ''));
+    ['gapsView', 'conflictsView', 'anomaliesView', 'httpView'].forEach((v) => (el(v).innerHTML = ''));
     ui.textView.textContent = '';
     ui.hexView.textContent = '';
   }
@@ -310,6 +311,13 @@
 
   function renderConnStats() {
     const d = currentDirection();
+    const http = d.http;
+    const httpSpan =
+      http && http.messages.length
+        ? '<span>HTTP 完整 <b>' + http.summary.complete + '</b> / 未完成 <b>' +
+          http.summary.incomplete + '</b> / 不支持 <b>' + http.summary.unsupported +
+          '</b> / 非法 <b>' + http.summary.invalid + '</b></span>'
+        : '';
     ui.connStats.innerHTML =
       '<span>包 <b>' + d.packetCount + '</b></span>' +
       '<span>数据段 <b>' + d.segmentCount + '</b></span>' +
@@ -317,6 +325,7 @@
       '<span class="gap">缺口 <b>' + d.gaps.length + '</b> 个 / ' + d.gapBytes + ' 字节</span>' +
       '<span class="conflict">冲突 <b>' + d.conflicts.length + '</b> 字节</span>' +
       '<span>跨度 <b>' + d.totalSpan + '</b></span>' +
+      httpSpan +
       (d.isnRaw !== null ? '<span class="muted">ISN 0x' + (d.isnRaw >>> 0).toString(16) + '</span>' : '<span class="muted">未见 SYN（无 ISN）</span>');
   }
 
@@ -330,6 +339,7 @@
     if (activeTab === 'gaps') renderGaps(d);
     if (activeTab === 'conflicts') renderConflicts(d);
     if (activeTab === 'text') renderText(d);
+    if (activeTab === 'http') renderHttp(d);
     if (activeTab === 'hex') renderHex(d);
     if (activeTab === 'anomalies') renderAnomalies(d);
   }
@@ -417,6 +427,127 @@
     const esc = escapeHtml(d.text);
     ui.textView.innerHTML = esc.replace(/␠\[[^\]]*\]/g, (m) => '<span class="gapmark">' + m + '</span>');
   }
+
+  // ---- 限定版 HTTP/1.1 报文视图 ----
+  // 数据来自 Worker 解析时一次完成、并随冻结快照保存的分析结果（d.http），
+  // 页面选中项与 JSON 导出引用同一份快照，此处不做任何重新识别。
+  const HTTP_STATUS_TEXT = { complete: '完整', incomplete: '未完成', unsupported: '不支持', invalid: '非法' };
+  const HTTP_STATUS_CLASS = { complete: 'ok', incomplete: 'warn', unsupported: 'snap', invalid: 'conflict' };
+
+  function renderHttp(d) {
+    const http = d.http;
+    if (!http) {
+      ui.httpView.innerHTML = '<div class="empty">该方向没有 HTTP 分析结果。</div>';
+      return;
+    }
+    if (!http.messages.length && !http.unrecognized.length) {
+      ui.httpView.innerHTML = '<div class="empty">该方向没有有效载荷，未识别出 HTTP/1.1 报文。</div>';
+      return;
+    }
+    const s = http.summary;
+    const parts = [];
+    parts.push(
+      '<div class="http-summary">识别结果：完整 <b>' + s.complete + '</b> · 未完成 <b>' + s.incomplete +
+        '</b> · 不支持 <b>' + s.unsupported + '</b> · 非法 <b>' + s.invalid + '</b>' +
+        (s.unrecognizedBytes ? ' · 未识别字节 <b>' + s.unrecognizedBytes + '</b>' : '') +
+        '<div class="muted">仅在连续且无冲突的字节上识别 HTTP/1.1（起始行 + CRLF 头部 + 显式 Content-Length）；' +
+        '跨缺口 / 冲突 / 截断 / 长度不完整的候选一律标为未完成，不拼接、不猜测正文边界。</div></div>'
+    );
+    http.messages.forEach((m, i) => parts.push(renderHttpMessage(d, m, i)));
+    http.unrecognized.forEach((u) => parts.push(renderHttpUnrecognized(d, u)));
+    ui.httpView.innerHTML = parts.join('');
+  }
+
+  function renderHttpMessage(d, m, i) {
+    const rb = d.relBase || 0;
+    const tag =
+      '<span class="tag ' + (HTTP_STATUS_CLASS[m.status] || 'warn') + '">' +
+      (HTTP_STATUS_TEXT[m.status] || m.status) + '</span>';
+    let title;
+    if (m.kind === 'request') {
+      title = '请求 <b>' + escapeHtml(m.method) + ' ' + escapeHtml(m.target) + '</b>';
+    } else if (m.kind === 'response') {
+      title = '响应 <b>' + m.statusCode + (m.reasonPhrase ? ' ' + escapeHtml(m.reasonPhrase) : '') + '</b>';
+    } else {
+      title = '<b>（起始行未完整的候选）</b>';
+    }
+
+    const rangeBits = [];
+    if (m.range.headerEnd !== null) {
+      rangeBits.push('头部 [' + (m.range.start + rb) + ', ' + (m.range.headerEnd + rb) + ')');
+    } else {
+      rangeBits.push('起始于相对序号 ' + (m.range.start + rb));
+    }
+    if (m.range.bodyStart !== null && m.bodyLength !== null) {
+      rangeBits.push(
+        '正文 [' + (m.range.bodyStart + rb) + ', ' + (m.range.bodyStart + m.bodyLength + rb) + ') 共 ' + m.bodyLength + ' 字节'
+      );
+    }
+    if (m.declaredEnd !== null && m.capturedEnd !== null && m.declaredEnd > m.capturedEnd) {
+      rangeBits.push('声明终点 ' + (m.declaredEnd + rb) + '，捕获仅到 ' + (m.capturedEnd + rb));
+    } else if (m.capturedEnd !== null) {
+      rangeBits.push('区间 [' + (m.range.start + rb) + ', ' + (m.capturedEnd + rb) + ')');
+    }
+
+    const evidence = m.packets.length
+      ? m.packets.map((p) => '#' + (p + 1)).join('、')
+      : '（无）';
+    const headerRows = m.headers
+      .map((h) => '<tr><td>' + escapeHtml(h.name) + '</td><td class="wrap">' + escapeHtml(h.value) + '</td></tr>')
+      .join('');
+    const reasons = m.reasons.map((r) => '<div class="http-reason">⚠ ' + escapeHtml(r) + '</div>').join('');
+
+    return (
+      '<div class="http-card">#' + (i + 1) + ' ' + tag + ' ' + title +
+      '<div class="pos">' + rangeBits.join(' · ') + '</div>' +
+      '<div class="muted">起始行：<code>' +
+        escapeHtml(m.startLine !== null ? m.startLine : '(未完整捕获) ' + (m.partialStartLine || '')) +
+        '</code></div>' +
+      (headerRows ? '<table class="grid http-hdrs"><tbody>' + headerRows + '</tbody></table>' : '') +
+      (m.contentLength !== null ? '<div class="muted">Content-Length: ' + m.contentLength + '</div>' : '') +
+      (m.transferEncoding !== null
+        ? '<div class="muted">Transfer-Encoding: ' + escapeHtml(m.transferEncoding) + '</div>'
+        : '') +
+      '<div class="muted">字节证据（区间内字节的属主包，即文件中先捕获者）：包 ' + evidence + '</div>' +
+      reasons +
+      httpBodyPreview(d, m) +
+      '</div>'
+    );
+  }
+
+  /** 完整报文的正文预览（限前 160 字节）；只读冻结快照中的 run 字节。 */
+  function httpBodyPreview(d, m) {
+    if (m.status !== 'complete' || !m.bodyLength) return '';
+    const run = d.runs.find((r) => r.start <= m.range.bodyStart && r.end >= m.range.end);
+    if (!run) return '';
+    const max = 160;
+    const n = Math.min(m.bodyLength, max);
+    let out = '';
+    for (let i = 0; i < n; i++) {
+      const b = run.bytes[m.range.bodyStart - run.start + i];
+      if (b === 0x0a) out += '\n';
+      else if (b === 0x0d) out += '␍';
+      else if (b >= 0x20 && b <= 0x7e) out += String.fromCharCode(b);
+      else out += '\\x' + hex2(b);
+    }
+    return (
+      '<pre class="http-preview">' + escapeHtml(out) +
+      (m.bodyLength > max ? '…（共 ' + m.bodyLength + ' 字节，仅预览前 ' + max + '）' : '') +
+      '</pre>'
+    );
+  }
+
+  function renderHttpUnrecognized(d, u) {
+    const rb = d.relBase || 0;
+    return (
+      '<div class="http-card unrecognized">未识别字节区域' +
+      '<div class="pos">相对序号区间 [' + (u.start + rb) + ', ' + (u.end + rb) + ') · ' + (u.end - u.start) + ' 字节</div>' +
+      '<div class="muted">' + escapeHtml(u.reason) + '</div>' +
+      (u.preview ? '<pre class="http-preview">' + escapeHtml(u.preview) + '</pre>' : '') +
+      '</div>'
+    );
+  }
+
 
   function renderAnomalies(d) {
     const all = d.anomalies.slice();

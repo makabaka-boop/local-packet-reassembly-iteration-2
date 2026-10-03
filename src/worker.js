@@ -11,7 +11,7 @@
 'use strict';
 
 try {
-  importScripts('pcap.js', 'reassemble.js');
+  importScripts('pcap.js', 'reassemble.js', 'httpview.js');
 } catch (e) {
   // importScripts 路径错误时给出明确错误，而不是静默失败。
   self.postMessage({
@@ -45,6 +45,9 @@ self.onmessage = function (ev) {
     }
     const parsed = self.PcapLib.parse(bytes, { maxPackets: maxPackets || 2000 });
     const model = self.ReassemblyLib.buildModel(parsed, bytes);
+    // 限定版 HTTP/1.1 报文识别随解析一次完成，与重组结果一起进入冻结快照；
+    // 页面选中项与 JSON 导出因此引用同一份结果，不会在导出时重算。
+    if (self.HttpViewLib) self.HttpViewLib.annotateModel(model);
 
     // 解析一完成即冻结；导出引用的是这份快照，不会随后续操作变化。
     const snapshot = self.ReassemblyLib.freezeModel(model, {

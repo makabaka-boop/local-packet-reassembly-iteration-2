@@ -329,13 +329,26 @@
       const totalSpan = streamEnd - streamStart;
       const gapBytes = gaps.reduce((n, g) => n + g.length, 0);
 
-      const outputRuns = runs.map((run) => ({
-        start: run.start,
-        relStart: run.start + relBase,
-        end: run.end,
-        relEnd: run.end + relBase,
-        bytes: run.bytes
-      }));
+      const outputRuns = runs.map((run) => {
+        // 每段连续位置的属主包（文件中先捕获者）压缩为 spans，供报文级视图
+        // 引用“字节区间 ← 包号”证据；相同字节的重传与冲突方都不在属主之列。
+        const sources = [];
+        for (let i = 0; i < run.owners.length; i++) {
+          const owner = run.owners[i];
+          const pos = run.start + i;
+          const last = sources[sources.length - 1];
+          if (last && last.pktIndex === owner) last.end = pos + 1;
+          else sources.push({ start: pos, end: pos + 1, pktIndex: owner });
+        }
+        return {
+          start: run.start,
+          relStart: run.start + relBase,
+          end: run.end,
+          relEnd: run.end + relBase,
+          bytes: run.bytes,
+          sources
+        };
+      });
 
       // ---- 重组文本：缺口处显式占位，绝不把缺口两侧文本直接相连 ----
       const decoder = new TextDecoder('utf-8');

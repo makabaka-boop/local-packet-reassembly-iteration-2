@@ -2,7 +2,10 @@
  * 生成一个“演示用”小端 PCAP：samples/demo.pcap
  * 内含：
  *   - 一条完整 TCP 连接（握手、乱序、相同重传、字节冲突、缺口、snaplen 截断）；
- *   - 同一四元组复用的第二次会话（FIN 关闭后新 ISN 重连，RST 收尾）；
+ *     其载荷为 HTTP/1.1 报文：请求头部跨包且带冲突（HTTP 视图标“未完成”），
+ *     响应正文跨缺口（同样“未完成”）；
+ *   - 同一四元组复用的第二次会话（FIN 关闭后新 ISN 重连，RST 收尾），
+ *     内含完整的 HTTP/1.1 请求与响应（HTTP 视图标“完整”）；
  *   - 两次会话之间夹杂的另一条连接（验证拆分状态按四元组隔离）；
  *   - 一个非 IPv4 帧（展示“未纳入重组”）。
  * 运行：node test/make-sample.js
@@ -68,20 +71,20 @@ records.push(pkt(ISN_C, 0, FLAGS.SYN, Buffer.alloc(0), true));          // 握�
 records.push(pkt(ISN_S, ISN_C + 1, FLAGS.SYN | FLAGS.ACK, Buffer.alloc(0), false));
 records.push(pkt(ISN_C + 1, ISN_S + 1, FLAGS.ACK, Buffer.alloc(0), true));
 
-// 客户端请求 "GET /demo HTTP/1.0\r\n\r\n"（22 字节），故意乱序 + 重传 + 冲突
-const req = Buffer.from('GET /demo HTTP/1.0\r\n\r\n'); // seq 1001..1022
+// 客户端请求 "GET /demo HTTP/1.1" + Host 头（40 字节），故意乱序 + 重传 + 冲突
+const req = Buffer.from('GET /demo HTTP/1.1\r\nHost: demo.local\r\n\r\n'); // seq 1001..1040
 records.push(pkt(1001 + 10, ISN_S + 1, FLAGS.ACK, req.slice(10), true)); // 先到尾段
 records.push(pkt(1001, ISN_S + 1, FLAGS.PSH | FLAGS.ACK, req.slice(0, 10), true)); // 后到头段
 records.push(pkt(1001 + 10, ISN_S + 1, FLAGS.ACK, req.slice(10), true)); // 完全相同重传
-// 冲突：把第 15 字节（位置 1015，原 '/' 附近）发成 'Z'
-const evil = Buffer.from(req); evil[14] = 0x5a;
-records.push(pkt(1001 + 14, ISN_S + 1, FLAGS.ACK, evil.slice(14, 16), true));
+// 冲突：Host 值的 'd'（报文内偏移 26）被后到的包发成 'Z'；先捕获的尾段保留 'd'
+const evil = Buffer.from(req); evil[26] = 0x5a;
+records.push(pkt(1001 + 26, ISN_S + 1, FLAGS.ACK, evil.slice(26, 28), true));
 
-// 服务端响应，故意留一个缺口：位置 8..11（4 字节）不到
-const resp = Buffer.from('Hello, this is a reassembled TCP response body for the demo!!'); // 60B
-records.push(pkt(ISN_S + 1, ISN_C + 20, FLAGS.PSH | FLAGS.ACK, resp.slice(0, 8), false));
-records.push(pkt(ISN_S + 1 + 12, ISN_C + 20, FLAGS.ACK, resp.slice(12, 40), false)); // 跳过 8..12 => 缺口
-records.push(pkt(ISN_S + 1 + 40, ISN_C + 20, FLAGS.ACK, resp.slice(40), false));
+// 服务端响应：HTTP/1.1 200 + Content-Length: 32，正文中间故意留 4 字节缺口
+const rhead = Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n'); // 39B
+const rbody = Buffer.from('DEMO-BODY-0123456789ABCDEFGHIJKL'); // 32B
+records.push(pkt(ISN_S + 1, ISN_C + 41, FLAGS.PSH | FLAGS.ACK, Buffer.concat([rhead, rbody.slice(0, 8)]), false));
+records.push(pkt(ISN_S + 1 + 39 + 12, ISN_C + 41, FLAGS.ACK, rbody.slice(12), false)); // 跳过 body[8..12) => 缺口
 
 // 一个非 IPv4 帧（EtherType ARP 0x0806），展示“未纳入重组”
 const arpFrame = Buffer.alloc(42);
@@ -89,10 +92,10 @@ arpFrame[12] = 0x08; arpFrame[13] = 0x06;
 records.push(rec(arpFrame));
 
 // ---- 会话 1 正常关闭（双向 FIN + 末尾 ACK）----
-// 客户端已发 22 字节（seq 1001..1022），服务端已发 60 字节（seq 7001..7060）
-records.push(pkt(ISN_C + 1 + 22, ISN_S + 1 + 60, FLAGS.FIN | FLAGS.ACK, Buffer.alloc(0), true));
-records.push(pkt(ISN_S + 1 + 60, ISN_C + 1 + 23, FLAGS.FIN | FLAGS.ACK, Buffer.alloc(0), false));
-records.push(pkt(ISN_C + 1 + 23, ISN_S + 1 + 61, FLAGS.ACK, Buffer.alloc(0), true));
+// 客户端已发 40 字节（seq 1001..1040），服务端已发 71 字节（seq 7001..7071）
+records.push(pkt(ISN_C + 1 + 40, ISN_S + 1 + 71, FLAGS.FIN | FLAGS.ACK, Buffer.alloc(0), true));
+records.push(pkt(ISN_S + 1 + 71, ISN_C + 1 + 41, FLAGS.FIN | FLAGS.ACK, Buffer.alloc(0), false));
+records.push(pkt(ISN_C + 1 + 41, ISN_S + 1 + 72, FLAGS.ACK, Buffer.alloc(0), true));
 
 // ---- 两次会话之间夹杂的另一条连接（不同四元组）----
 const other = (seq, ack, flags, body, fromA) =>
@@ -108,15 +111,17 @@ records.push(other(80000, 31338, FLAGS.SYN | FLAGS.ACK, Buffer.alloc(0), false))
 records.push(other(31338, 80001, FLAGS.ACK, Buffer.from('interleaved connection'), true));
 
 // ---- 同一四元组复用的第二次会话：新 ISN 重连，RST 异常收尾 ----
+// 本会话含完整的 HTTP/1.1 请求与响应（HTTP 视图应标“完整”，且不续接会话 1 的残余）
 const ISN_C2 = 0x20000010, ISN_S2 = 0x60000020;
 records.push(pkt(ISN_C2, 0, FLAGS.SYN, Buffer.alloc(0), true));
 records.push(pkt(ISN_S2, ISN_C2 + 1, FLAGS.SYN | FLAGS.ACK, Buffer.alloc(0), false));
 records.push(pkt(ISN_C2 + 1, ISN_S2 + 1, FLAGS.ACK, Buffer.alloc(0), true));
-const req2 = Buffer.from('GET /second HTTP/1.0\r\n\r\n'); // 24 字节
+const req2 = Buffer.from('GET /second HTTP/1.1\r\nHost: demo.local\r\n\r\n'); // 42B
 records.push(pkt(ISN_C2 + 1, ISN_S2 + 1, FLAGS.PSH | FLAGS.ACK, req2, true));
-const resp2 = Buffer.from('SECOND SESSION RESPONSE (same 4-tuple)');
-records.push(pkt(ISN_S2 + 1, ISN_C2 + 1 + req2.length, FLAGS.PSH | FLAGS.ACK, resp2, false));
-records.push(pkt(ISN_C2 + 1 + req2.length, ISN_S2 + 1 + resp2.length, FLAGS.RST | FLAGS.ACK, Buffer.alloc(0), true));
+const rhead2 = Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n'); // 39B
+const rbody2 = Buffer.from('SECOND-SESSION-BODY!'); // 20B
+records.push(pkt(ISN_S2 + 1, ISN_C2 + 1 + req2.length, FLAGS.PSH | FLAGS.ACK, Buffer.concat([rhead2, rbody2]), false));
+records.push(pkt(ISN_C2 + 1 + req2.length, ISN_S2 + 1 + rhead2.length + rbody2.length, FLAGS.RST | FLAGS.ACK, Buffer.alloc(0), true));
 
 const outDir = path.join(__dirname, '..', 'samples');
 fs.mkdirSync(outDir, { recursive: true });

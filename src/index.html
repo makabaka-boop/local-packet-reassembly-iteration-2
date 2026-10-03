@@ -58,6 +58,7 @@
         <button class="tab" data-tab="gaps">缺口</button>
         <button class="tab" data-tab="conflicts">冲突</button>
         <button class="tab" data-tab="text">重组文本</button>
+        <button class="tab" data-tab="http">HTTP 报文</button>
         <button class="tab" data-tab="hex">十六进制</button>
         <button class="tab" data-tab="anomalies">异常</button>
       </nav>
@@ -85,6 +86,10 @@
 
         <div class="panel" data-panel="text">
           <pre id="textView" class="textview"></pre>
+        </div>
+
+        <div class="panel" data-panel="http">
+          <div id="httpView"></div>
         </div>
 
         <div class="panel" data-panel="hex">

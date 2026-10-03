@@ -181,8 +181,10 @@ body {
 .tag.retrans { background: rgba(76,195,138,.18); color: var(--ok); }
 .tag.conflict { background: rgba(255,93,77,.18); color: var(--conflict); }
 .tag.snap { background: rgba(224,163,64,.18); color: var(--warn); }
+.tag.ok { background: rgba(76,195,138,.18); color: var(--ok); }
+.tag.warn { background: rgba(224,163,64,.18); color: var(--warn); }
 
-.gap-card, .conflict-card, .ano-card {
+.gap-card, .conflict-card, .ano-card, .http-card {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px 12px;
@@ -194,6 +196,24 @@ body {
 .bytes-line { font-family: ui-monospace, Menlo, monospace; margin-top: 4px; }
 .muted { color: var(--muted); }
 .empty { color: var(--muted); padding: 16px 4px; }
+
+.http-summary { margin-bottom: 10px; }
+.http-summary .muted { margin-top: 2px; }
+.http-card .pos { color: var(--accent); font-family: ui-monospace, Menlo, monospace; margin: 2px 0; }
+.http-card .http-reason { color: var(--warn); margin-top: 4px; }
+.http-card table.http-hdrs { margin: 6px 0; }
+.http-card.unrecognized { border-style: dashed; }
+.http-preview {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 
 .textview {
   font-family: ui-monospace, Menlo, Consolas, monospace;
