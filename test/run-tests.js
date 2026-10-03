@@ -785,6 +785,430 @@ test('同四元组三次会话 + 失败连接尝试（仅 SYN）：各自独立�
   assert.strictEqual(model.connections[2].directionAtoB.isnRaw, 0x50000000);
 });
 
+// ---------------- 限定版 HTTP/1.1 报文识别 ----------------
+
+function httpDir(model, connIndex, dir) {
+  const conn = model.connections[connIndex];
+  return dir === 'AtoB' ? conn.directionAtoB.http : conn.directionBtoA.http;
+}
+
+/** 构造一条完整方向流的客户端请求（默认无握手，首段 seq=1000）。 */
+function httpStream(segments, { seq = 1000, srcIp = '10.0.0.1', dstIp = '10.0.0.2', srcPort = 1111, dstPort = 80 } = {}) {
+  const recs = [];
+  let s = seq;
+  for (const p of segments) {
+    const buf = Buffer.isBuffer(p) ? p : p.payload;
+    const opts = Buffer.isBuffer(p) ? {} : p;
+    recs.push(tcpPkt(Object.assign({
+      seq: s, payload: buf, srcIp, dstIp, srcPort, dstPort
+    }, opts)));
+    s += buf.length;
+  }
+  return buildPcap(recs);
+}
+
+function oneDir(buf, splitAt) {
+  // 单方向、连续、无缺口：可把完整报文拆到多个包（跨包头部）
+  const segs = [];
+  if (splitAt) {
+    let o = 0;
+    for (const cut of splitAt) { segs.push(buf.slice(o, cut)); o = cut; }
+    segs.push(buf.slice(o));
+  } else {
+    segs.push(buf);
+  }
+  return buildFromBuf(httpStream(segs));
+}
+
+test('HTTP：完整请求无消息体（仅头部），区间与包号证据正确', () => {
+  tsCounter = 20000000;
+  const req = Buffer.from('GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n');
+  const { model } = oneDir(req);
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 1);
+  const m = h.messages[0];
+  assert.strictEqual(m.status, 'complete');
+  assert.strictEqual(m.kind, 'request');
+  assert.strictEqual(m.startLine.method, 'GET');
+  assert.strictEqual(m.startLine.target, '/index.html');
+  assert.strictEqual(m.bodyLengthExpected, 0);
+  assert.strictEqual(m.relStart, 0, '无 SYN 时锚点为首个数据段 seq，首字节展开坐标为 0');
+  assert.strictEqual(m.relEnd, req.length);
+  assert.strictEqual(m.presentBytes, req.length);
+  assert.deepStrictEqual(m.evidence.packets.map((p) => p.pktNumber), [1]);
+});
+
+test('HTTP：跨包起始行与头部（在任意边界拆包），仍是同一连续字节上的完整报文', () => {
+  tsCounter = 20100000;
+  const req = Buffer.from('POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world');
+  // 起始行中间、CRLF 中间、头部中间、空行中间、消息体中间都切开
+  const { model } = oneDir(req, [4, 5, 12, 30, 41, 45, 55, 57]);
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 1);
+  const m = h.messages[0];
+  assert.strictEqual(m.status, 'complete', '跨包不影响完整性：' + (m.reason || ''));
+  assert.strictEqual(m.bodyLengthPresent, 11);
+  // 证据段覆盖全部 9 个包，首尾区间拼起来等于整个报文区间
+  const spans = m.evidence.packets;
+  assert.ok(spans.length >= 2, '跨多个包');
+  assert.deepStrictEqual([spans[0].start, spans[spans.length - 1].end], [m.start, m.end]);
+  let total = 0;
+  for (let i = 0; i < spans.length; i++) {
+    assert.strictEqual(spans[i].end - spans[i].start, spans[i].bytes);
+    if (i > 0) assert.strictEqual(spans[i].start, spans[i - 1].end, '证据段必须首尾相接无重叠');
+    total += spans[i].bytes;
+  }
+  assert.strictEqual(total, req.length);
+});
+
+test('HTTP：相同字节重传不改变报文；重传包号作为旁证列出', () => {
+  tsCounter = 20200000;
+  const req = Buffer.from('GET /r HTTP/1.1\r\n\r\n');
+  const recs = [
+    tcpPkt({ seq: 1000, payload: req.slice(0, 10) }),
+    tcpPkt({ seq: 1010, payload: req.slice(10) }),
+    tcpPkt({ seq: 1000, payload: req.slice(0, 10) }), // 完全相同重传
+    tcpPkt({ seq: 1010, payload: req.slice(10) }) // 完全相同重传
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 1);
+  assert.strictEqual(h.messages[0].status, 'complete');
+  // 归属证据只含首见包 #1、#2；旁证含重传包 #3、#4
+  assert.deepStrictEqual(h.messages[0].evidence.packets.map((p) => p.pktNumber), [1, 2]);
+  assert.deepStrictEqual(h.messages[0].evidence.retransmitPackets, [2, 3]);
+});
+
+test('HTTP：头部区域存在字节冲突 => 语法再完整也标未完成', () => {
+  tsCounter = 20300000;
+  const req = Buffer.from('GET /c HTTP/1.1\r\n\r\n');
+  const evil = Buffer.from(req); evil[8] = 0x58; // 位置 1008 -> 展开 8
+  const recs = [
+    tcpPkt({ seq: 1000, payload: req }), // 正确字节先捕获（首见保留）
+    tcpPkt({ seq: 1008, payload: evil.slice(8, 9) }) // 冲突字节后到
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 1);
+  const m = h.messages[0];
+  assert.strictEqual(m.status, 'incomplete');
+  assert.strictEqual(m.reasonCode, 'conflict_in_message');
+  assert.ok(m.conflicts.length >= 1);
+  assert.strictEqual(m.conflicts[0].ownerPkt, 0, '先捕获的正确字节保留（pktIndex 从 0 起）');
+});
+
+test('HTTP：消息体区域存在字节冲突 => 同样标未完成（不输出伪完整报文）', () => {
+  tsCounter = 20350000;
+  const req = Buffer.from('POST /b HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc');
+  const evil = Buffer.from(req); evil[evil.length - 2] = 0x5a; // 正文 'b'->'Z'
+  const recs = [
+    tcpPkt({ seq: 1000 + evil.length - 3, payload: evil.slice(evil.length - 3, evil.length - 1) }), // 正文前两字节先到（含 Z）
+    tcpPkt({ seq: 1000, payload: req }) // 完整正确后到 => 仅正文位置冲突
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  const h = httpDir(model, 0, 'AtoB');
+  const m = h.messages[0];
+  assert.strictEqual(m.status, 'incomplete');
+  assert.strictEqual(m.reasonCode, 'conflict_in_message');
+});
+
+test('HTTP：头部块中间有缺口 => 不拼接缺口两侧文本，候选标未完成', () => {
+  tsCounter = 20400000;
+  // GET /g HTTP/1.1\r\nX-A: 1\r\n\r\n —— 故意丢掉中间 4 字节
+  const full = Buffer.from('GET /g HTTP/1.1\r\nX-A: 1\r\n\r\n');
+  const gapAt = 12, miss = 4;
+  const recs = [
+    tcpPkt({ seq: 1000, payload: full.slice(0, gapAt) }),
+    tcpPkt({ seq: 1000 + gapAt + miss, payload: full.slice(gapAt + miss) })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  const d = model.connections[0].directionAtoB;
+  assert.strictEqual(d.gaps.length, 1);
+  const h = d.http;
+  assert.ok(h.messages.length >= 1);
+  assert.ok(h.messages.every((m) => m.status !== 'complete'), '跨缺口不得产生完整报文');
+  assert.ok(h.messages.some((m) => m.reasonCode === 'truncated_start_line' || m.reasonCode === 'truncated_header_block'));
+});
+
+test('HTTP：Content-Length 正文跨过缺口 => body_crosses_gap，明确不读缺口另一侧', () => {
+  tsCounter = 20500000;
+  const head = Buffer.from('POST /gap HTTP/1.1\r\nContent-Length: 10\r\n\r\n');
+  const body = Buffer.from('0123456789');
+  // 前 4 字节正文到达，缺 1 字节，后 5 字节在缺口另一侧
+  const recs = [
+    tcpPkt({ seq: 1000, payload: Buffer.concat([head, body.slice(0, 4)]) }),
+    tcpPkt({ seq: 1000 + head.length + 5, payload: body.slice(5) })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 1);
+  const m = h.messages[0];
+  assert.strictEqual(m.status, 'incomplete');
+  assert.strictEqual(m.reasonCode, 'body_crosses_gap');
+  assert.strictEqual(m.bodyLengthExpected, 10);
+  assert.strictEqual(m.bodyLengthPresent, 4, '只有连续区内的 4 字节算已呈现');
+  assert.ok(m.crossesGap);
+  assert.strictEqual(m.gap.length, 1);
+  assert.strictEqual(m.end, m.bodyStart + 4, '区间不得越过缺口包含另一侧字节');
+});
+
+test('HTTP：正文跨过缺口且缺口另一侧也有完整起始线 => 两侧分别识别，不续接', () => {
+  tsCounter = 20550000;
+  const head = Buffer.from('POST /gap HTTP/1.1\r\nContent-Length: 8\r\n\r\n');
+  const firstBody = Buffer.from('AAAA');
+  const other = Buffer.from('GET /next HTTP/1.1\r\n\r\n');
+  // head+4B 后，缺口 8 字节，缺口另一侧是另一条完整请求
+  const recs = [
+    tcpPkt({ seq: 1000, payload: Buffer.concat([head, firstBody]) }),
+    tcpPkt({ seq: 1000 + head.length + 4 + 8, payload: other })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  const h = httpDir(model, 0, 'AtoB');
+  // 第一条：未完成跨缺口；第二条：缺口另一侧独立 run 内的完整报文
+  const inc = h.messages.find((m) => m.status === 'incomplete');
+  const ok = h.messages.find((m) => m.status === 'complete');
+  assert.ok(inc, '前一条必须标未完成');
+  assert.strictEqual(inc.reasonCode, 'body_crosses_gap');
+  assert.ok(ok, '缺口另一侧的合法请求应独立识别为完整');
+  assert.strictEqual(ok.startLine.target, '/next');
+  assert.ok(ok.start > inc.end, '第二条区间在缺口另一侧，不与第一条拼接');
+});
+
+test('HTTP：捕获在头部块/起始线中间结束 => truncated，标未完成', () => {
+  tsCounter = 20600000;
+  let { model } = buildFromBuf(httpStream([Buffer.from('GET /trunc HTTP/1.1\r\nHost:')]));
+  let h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages[0].status, 'incomplete');
+  assert.strictEqual(h.messages[0].reasonCode, 'truncated_header_block');
+
+  tsCounter = 20650000;
+  ({ model } = buildFromBuf(httpStream([Buffer.from('GET /partial')])));
+  h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages[0].status, 'incomplete');
+  assert.strictEqual(h.messages[0].reasonCode, 'truncated_start_line');
+});
+
+test('HTTP：非法 Content-Length（非数字 / 多个不一致 / 逗号列表）一律未完成', () => {
+  tsCounter = 20700000;
+  const cases = [
+    'GET /a HTTP/1.1\r\nContent-Length: abc\r\n\r\n',
+    'GET /a HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n',
+    'GET /a HTTP/1.1\r\nContent-Length: 1, 2\r\n\r\n'
+  ];
+  for (const c of cases) {
+    tsCounter += 1000;
+    const { model } = oneDir(Buffer.from(c));
+    const m = httpDir(model, 0, 'AtoB').messages[0];
+    assert.strictEqual(m.status, 'incomplete', c);
+    assert.strictEqual(m.reasonCode, 'invalid_content_length', c);
+  }
+  // 多个取值一致的 Content-Length 仍接受（值明确）
+  tsCounter += 1000;
+  const { model } = oneDir(Buffer.from('GET /a HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc'));
+  const m = httpDir(model, 0, 'AtoB').messages[0];
+  assert.strictEqual(m.status, 'complete');
+  assert.strictEqual(m.bodyLengthExpected, 3);
+});
+
+test('HTTP：Transfer-Encoding: chunked 明确标记不支持，不猜测正文边界', () => {
+  tsCounter = 20800000;
+  const buf = Buffer.from(
+    'POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\nGET /pipelined HTTP/1.1\r\n\r\n'
+  );
+  const { model } = oneDir(buf);
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 1, 'TE 不支持，后续流水线字节不得再被识别为报文');
+  const m = h.messages[0];
+  assert.strictEqual(m.status, 'unsupported');
+  assert.strictEqual(m.reasonCode, 'unsupported_transfer_encoding_chunked');
+  assert.strictEqual(m.headerEnd, m.end, '区间到头部块结束为止，正文不纳入');
+  assert.ok(h.notices.some((n) => n.type === 'unparsed_trailing'));
+});
+
+test('HTTP：非 chunked 的 Transfer-Encoding 也明确标记不支持', () => {
+  tsCounter = 20850000;
+  const buf = Buffer.from('GET /g HTTP/1.1\r\nTransfer-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello');
+  const { model } = oneDir(buf);
+  const m = httpDir(model, 0, 'AtoB').messages[0];
+  assert.strictEqual(m.status, 'unsupported');
+  assert.strictEqual(m.reasonCode, 'unsupported_transfer_encoding');
+});
+
+test('HTTP：响应起始线（status-line）识别，3 位状态码与原因短语', () => {
+  tsCounter = 20900000;
+  const resp = Buffer.from('HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n');
+  const recs = [
+    tcpPkt({ seq: 2000, srcIp: '10.0.0.2', srcPort: 80, dstIp: '10.0.0.1', dstPort: 1111, payload: resp })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  // IP 字典序归一化：10.0.0.1 为 A，因此 10.0.0.2:80 发出的响应是 A→B
+  const m = httpDir(model, 0, 'BtoA').messages[0];
+  assert.strictEqual(m.kind, 'response');
+  assert.strictEqual(m.status, 'complete');
+  assert.strictEqual(m.startLine.statusCode, 404);
+  assert.strictEqual(m.startLine.reasonPhrase, 'Not Found');
+});
+
+test('HTTP：非 HTTP/1.1 版本与非法起始线不识别（不编造报文）', () => {
+  tsCounter = 21000000;
+  let { model } = oneDir(Buffer.from('GET /old HTTP/1.0\r\n\r\n'));
+  let h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 0, 'HTTP/1.0 起始线不属于限定版');
+  assert.ok(h.notices.some((n) => n.type === 'unparsed_trailing'));
+
+  tsCounter = 21050000;
+  ({ model } = oneDir(Buffer.from('GARBAGE NOT HTTP AT ALL\r\n\r\n')));
+  h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 0);
+});
+
+test('HTTP：run 起始前缀再同步只做一次，跳过字节留痕，中途停止不猜边界', () => {
+  tsCounter = 21100000;
+  // run 第一行形如 "==junk==\rGET /s HTTP/1.1"：合法起始线起始于 \r 之后，
+  // 第一行内再同步定位到 GET；跳过的 "==junk==\r" 字节显式留痕。
+  const junk = Buffer.from('==junk==\r');
+  const req = Buffer.from('GET /s HTTP/1.1\r\n\r\n');
+  const tail = Buffer.from('NOTAHTTP');
+  const { model } = oneDir(Buffer.concat([junk, req, tail]));
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 1);
+  assert.strictEqual(h.messages[0].status, 'complete');
+  assert.strictEqual(h.messages[0].start, junk.length, '报文区间不含跳过前缀（锚点 0）');
+  const skip = h.notices.find((n) => n.type === 'skipped_prefix');
+  assert.ok(skip);
+  assert.strictEqual(skip.length, junk.length);
+  assert.ok(h.notices.some((n) => n.type === 'unparsed_trailing'));
+});
+
+test('HTTP：同一连续 run 内流水线多条报文依次识别', () => {
+  tsCounter = 21200000;
+  const a = Buffer.from('GET /1 HTTP/1.1\r\n\r\n');
+  const b = Buffer.from('POST /2 HTTP/1.1\r\nContent-Length: 2\r\n\r\nok');
+  const { model } = oneDir(Buffer.concat([a, b]), [3, 20]);
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 2);
+  assert.strictEqual(h.messages[0].startLine.target, '/1');
+  assert.strictEqual(h.messages[1].startLine.target, '/2');
+  assert.deepStrictEqual(h.messages.map((m) => m.status), ['complete', 'complete']);
+  assert.strictEqual(h.messages[1].start, a.length, '第二条紧接第一条之后（锚点 0）');
+});
+
+test('HTTP：同四元组端口复用——第二会话独立识别，不续接前会话残余', () => {
+  tsCounter = 21300000;
+  const recs = [
+    // 会话 1：只抓到一条残缺请求（CL 声称 10，正文只到 2 字节），然后 RST 关闭
+    cPkt({ seq: 1000, flags: FLAGS.SYN }),
+    sPkt({ seq: 9000, ack: 1001, flags: FLAGS.SYN | FLAGS.ACK }),
+    cPkt({ seq: 1001, payload: Buffer.from('POST /one HTTP/1.1\r\nContent-Length: 10\r\n\r\nAB') }),
+    cPkt({ seq: 1001 + 46, ack: 9001, flags: FLAGS.RST | FLAGS.ACK }),
+    // 会话 2：同四元组新 ISN，完整请求——不得把 'AB' 当作自己的前身
+    cPkt({ seq: 0x30000000, flags: FLAGS.SYN }),
+    sPkt({ seq: 0x70000000, ack: 0x30000001, flags: FLAGS.SYN | FLAGS.ACK }),
+    cPkt({ seq: 0x30000001, payload: Buffer.from('GET /two HTTP/1.1\r\n\r\n') })
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  assert.strictEqual(model.connections.length, 2);
+  const h1 = httpDir(model, 0, 'AtoB');
+  const h2 = httpDir(model, 1, 'AtoB');
+  assert.strictEqual(h1.messages.length, 1);
+  assert.strictEqual(h1.messages[0].status, 'incomplete');
+  assert.strictEqual(h1.messages[0].reasonCode, 'truncated_body');
+  assert.strictEqual(h2.messages.length, 1);
+  assert.strictEqual(h2.messages[0].status, 'complete', '第二会话不得续接前会话残余');
+  assert.strictEqual(h2.messages[0].startLine.target, '/two');
+  assert.deepStrictEqual(h2.messages[0].evidence.packets.map((p) => p.pktNumber), [7]);
+});
+
+test('HTTP：冻结快照内 messages 与 run 字节一致且为普通数组（同一快照）', () => {
+  tsCounter = 21400000;
+  const req = Buffer.from('GET /f HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc');
+  const buf = httpStream([req.slice(0, 20), req.slice(20)]);
+  const { model } = buildFromBuf(buf);
+  const snap = ReassemblyLib.freezeModel(model, { fileName: 'h.pcap' });
+  const d = snap.model.connections[0].directionAtoB;
+  assert.ok(Array.isArray(d.runs[0].bytes), '冻结后字节是普通数组');
+  assert.ok(Array.isArray(d.runs[0].owners), '冻结后 owner 是普通数组');
+  const m = d.http.messages[0];
+  assert.strictEqual(m.status, 'complete');
+  // 消息区间内逐字节的归属包号必须都能在 owners 中对应到实际捕获包
+  for (const span of m.evidence.packets) {
+    for (let p = span.start; p < span.end; p++) {
+      assert.strictEqual(d.runs[0].owners[p - d.runs[0].start], span.pktIndex);
+    }
+  }
+  // 消息体内的字节确实可从快照 run 字节取回
+  const body = d.runs[0].bytes.slice(m.bodyStart - d.runs[0].start, m.bodyEnd - d.runs[0].start);
+  assert.strictEqual(Buffer.from(body).toString(), 'abc');
+});
+
+test('HTTP：Content-Length: 0 与无 CL 无 TE（按空体）均完整', () => {
+  tsCounter = 21500000;
+  let { model } = oneDir(Buffer.from('GET /z HTTP/1.1\r\nContent-Length: 0\r\n\r\n'));
+  let m = httpDir(model, 0, 'AtoB').messages[0];
+  assert.strictEqual(m.status, 'complete');
+  assert.strictEqual(m.bodyLengthExpected, 0);
+
+  tsCounter = 21550000;
+  ({ model } = oneDir(Buffer.from('HTTP/1.1 204 No Content\r\nDate: x\r\n\r\n')));
+  m = httpDir(model, 0, 'AtoB').messages[0];
+  assert.strictEqual(m.status, 'complete');
+  assert.strictEqual(m.kind, 'response');
+  assert.strictEqual(m.bodyLengthExpected, 0, '无 CL 无 TE：限定版按空体，不猜连接关闭边界');
+});
+
+test('HTTP：起始线完整但头部行跨过缺口 => 标未完成，缺口另一侧不续接成同一报文', () => {
+  tsCounter = 21600000;
+  const a = Buffer.from('GET /h HTTP/1.1\r\nHost: exa');
+  const b = Buffer.from('mple.com\r\n\r\n');
+  const recs = [
+    tcpPkt({ seq: 1000, payload: a }),
+    tcpPkt({ seq: 1000 + a.length + 6, payload: b }) // 6 字节缺口
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  const h = httpDir(model, 0, 'AtoB');
+  assert.strictEqual(h.messages.length, 1, '只有头部所在 run 产出候选；另一侧不合并');
+  assert.strictEqual(h.messages[0].status, 'incomplete');
+  assert.strictEqual(h.messages[0].reasonCode, 'truncated_header_block');
+  // 缺口另一侧 run 以 'mple.com' 开头（含 CRLF 但不是合法起始线）：
+  // 不产生第二条伪报文，只留“未解析”痕跡。
+  assert.ok(h.notices.some((n) => n.type === 'unparsed_trailing'));
+});
+
+test('HTTP：冲突位置在报文区间之后，不影响该报文完整性', () => {
+  tsCounter = 21700000;
+  const req = Buffer.from('GET /o HTTP/1.1\r\n\r\n');
+  const extra = Buffer.from('XXXX');
+  const recs = [
+    tcpPkt({ seq: 1000, payload: req }),
+    tcpPkt({ seq: 1000 + req.length, payload: extra }),
+    tcpPkt({ seq: 1000 + req.length, payload: Buffer.from('YYYY') }) // 与上一段冲突
+  ];
+  const { model } = buildFromBuf(buildPcap(recs));
+  const h = httpDir(model, 0, 'AtoB');
+  const complete = h.messages.find((m) => m.status === 'complete');
+  assert.ok(complete, '报文区间内无冲突 => 完整');
+  assert.strictEqual(complete.end, req.length);
+  assert.strictEqual(complete.conflicts.length, 0);
+});
+
+test('HTTP：JSON 冻结导出包含 messages、包号证据与 owners，且为同一快照', () => {
+  tsCounter = 21800000;
+  const req = Buffer.from('GET /j HTTP/1.1\r\n\r\n');
+  const buf = httpStream([req.slice(0, 5), req.slice(5)]);
+  const { model } = buildFromBuf(buf);
+  const snap = ReassemblyLib.freezeModel(model, { fileName: 'j.pcap' });
+  const json = JSON.stringify(snap); // 导出路径
+  const reparsed = JSON.parse(json);
+  const d = reparsed.model.connections[0].directionAtoB;
+  const m = d.http.messages[0];
+  assert.strictEqual(m.status, 'complete');
+  assert.ok(Array.isArray(m.evidence.packets) && m.evidence.packets.length === 2);
+  assert.strictEqual(m.evidence.packets[0].pktNumber, 1);
+  assert.strictEqual(m.evidence.packets[1].pktNumber, 2);
+  assert.ok(Array.isArray(d.runs[0].owners));
+  assert.ok(snap.snapshotId);
+});
+
 // ---------------- 运行 ----------------
 
 let pass = 0;

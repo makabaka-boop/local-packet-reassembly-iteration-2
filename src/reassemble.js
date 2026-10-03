@@ -31,6 +31,11 @@
  *     控制包），归回其来源会话，不污染当前会话的冲突/缺口证据；
  *   - 每个 TCP 包恰好归属一个会话；拆分依据随会话保存并进入导出。
  *
+ * finalize 后每个方向附带 `http`（限定版 HTTP/1.1 报文识别，见 http.js）：
+ * 报文证据直接引用本文件产出的 runs/owners（逐字节首见包号）、conflicts、
+ * retransEvents（相同字节重传的旁证包号）与 gaps，因此报文区间、包号证据与
+ * 重组文本/十六进制视图引用的是同一套字节事实。
+ *
  * 可被 Worker 与 Node 测试同时加载。
  */
 (function (global, factory) {
@@ -42,6 +47,15 @@
 
   const TWO32 = 0x100000000;
   const HALF2 = 0x80000000; // 2^31
+
+  // 同目录的限定版 HTTP/1.1 识别器（Worker 经 importScripts 预置在 self 上；
+  // Node 测试直接 require）。加载失败时不影响 TCP 重组本身。
+  let HttpLib = null;
+  try {
+    HttpLib = typeof require !== 'undefined'
+      ? require('./http.js')
+      : (typeof self !== 'undefined' ? self.HttpLib : globalThis.HttpLib);
+  } catch (_) { HttpLib = null; }
 
   /**
    * 32 位模空间的有符号差值：b - a。
@@ -254,6 +268,8 @@
       // ---- 第二遍：按文件捕获顺序落字节 ----
       const conflictMap = new Map(); // pos -> {keptByte, ownerPkt, incoming:[]}
       const pktStats = new Map();
+      // 相同字节的重传到达：逐位置记录（HTTP 报文旁证包号用）。
+      const retransEvents = [];
       const bump = (pktIndex, key) => {
         let st = pktStats.get(pktIndex);
         if (!st) {
@@ -282,8 +298,9 @@
             run.bytes[idx] = byte;
             run.owners[idx] = s.pktIndex;
           } else if (run.bytes[idx] === byte) {
-            // 相同字节重传：去重。
+            // 相同字节重传：去重，但作为该位置的旁证保留。
             bump(s.pktIndex, 'retransmitBytes');
+            retransEvents.push({ pos: p, pktIndex: s.pktIndex });
           } else {
             // 字节不一致：冲突，保留首见字节，记录双方证据。
             bump(s.pktIndex, 'conflictBytes');
@@ -296,6 +313,8 @@
           }
         }
       }
+      // 重传事件按展开位置排序（落字节循环按捕获顺序产生，二分检索需按位置有序）。
+      retransEvents.sort((a, b) => a.pos - b.pos);
 
       // ---- 缺口 ----
       const gaps = [];
@@ -334,7 +353,9 @@
         relStart: run.start + relBase,
         end: run.end,
         relEnd: run.end + relBase,
-        bytes: run.bytes
+        bytes: run.bytes,
+        // 逐字节归属的包号（首见包）；HTTP 报文据此给出包号证据区间。
+        owners: run.owners
       }));
 
       // ---- 重组文本：缺口处显式占位，绝不把缺口两侧文本直接相连 ----
@@ -392,7 +413,7 @@
         };
       });
 
-      return {
+      const directionResult = {
         label: this.label,
         anchorRaw: anchor,
         anchorPkt: this.anchorPkt,
@@ -408,10 +429,21 @@
         gaps,
         conflicts,
         runs: outputRuns,
+        // 相同字节重传的逐位置事件（展开坐标，已按位置排序），供 HTTP 旁证引用。
+        retransEvents,
         text,
         packets: packetEntries,
         anomalies: this.anomalies
       };
+
+      // ---- 限定版 HTTP/1.1 报文识别：只在本方向、本会话的连续无冲突字节上做 ----
+      // 分析器直接引用上面的 runs/owners/conflicts/gaps 同一套字节事实；
+      // 缺口两侧永不拼接、冲突区间不输出完整报文、TE 只标不支持。
+      directionResult.http = HttpLib
+        ? HttpLib.analyze(directionResult)
+        : { messages: [], notices: [], parseVersion: 'http-unavailable' };
+
+      return directionResult;
     }
   }
 
@@ -703,7 +735,14 @@
 
   function cloneModel(model) {
     return JSON.parse(
-      JSON.stringify(model, (key, value) => (value instanceof Uint8Array ? Array.from(value) : value))
+      JSON.stringify(model, (key, value) => {
+        // 所有类型化数组（run 字节 Uint8Array、逐字节 owner Int32Array）都展开成
+        // 普通数组深拷贝，保证冻结快照与 Worker 工作缓冲完全不共享内存。
+        if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+          return Array.from(value);
+        }
+        return value;
+      })
     );
   }
 

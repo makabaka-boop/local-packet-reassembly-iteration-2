@@ -37,6 +37,7 @@
     packetsBody: el('packetsBody'),
     gapsView: el('gapsView'),
     conflictsView: el('conflictsView'),
+    httpView: el('httpView'),
     textView: el('textView'),
     hexView: el('hexView'),
     hexCapNote: el('hexCapNote'),
@@ -119,8 +120,10 @@
       // 旧 Worker 的迟到结果：直接丢弃。
       if (msg.token !== token || !isCurrentSession(token)) return;
       if (msg.ok) {
-        session.model = msg.model;
         session.snapshot = msg.snapshot;
+        // 页面、选中项、JSON 导出引用同一份冻结快照：model 就是快照内部对象，
+        // 不存在“实时模型”与“冻结结果”两份可能不一致的数据。
+        session.model = msg.snapshot.model;
         onParsed();
       } else {
         onParseFailed(msg);
@@ -247,7 +250,9 @@
           : '') +
         conn.packetCount + ' 包' +
         ' · A→B ' + dA.coveredBytes + 'B/' + dA.gaps.length + '缺/' + dA.conflicts.length + '冲突' +
+        (dA.http ? '/' + dA.http.messages.filter((m) => m.status === 'complete').length + '完整HTTP' : '') +
         ' · B→A ' + dB.coveredBytes + 'B/' + dB.gaps.length + '缺/' + dB.conflicts.length + '冲突' +
+        (dB.http ? '/' + dB.http.messages.filter((m) => m.status === 'complete').length + '完整HTTP' : '') +
         '</div>';
       li.addEventListener('click', () => selectConnection(i));
       ui.connList.appendChild(li);
@@ -260,7 +265,7 @@
     ui.connNote.classList.add('hidden');
     ui.connNote.textContent = '';
     ui.packetsBody.innerHTML = '';
-    ['gapsView', 'conflictsView', 'anomaliesView'].forEach((v) => (el(v).innerHTML = ''));
+    ['gapsView', 'conflictsView', 'httpView', 'anomaliesView'].forEach((v) => (el(v).innerHTML = ''));
     ui.textView.textContent = '';
     ui.hexView.textContent = '';
   }
@@ -329,6 +334,7 @@
     if (activeTab === 'packets') renderPackets(d);
     if (activeTab === 'gaps') renderGaps(d);
     if (activeTab === 'conflicts') renderConflicts(d);
+    if (activeTab === 'http') renderHttp(d);
     if (activeTab === 'text') renderText(d);
     if (activeTab === 'hex') renderHex(d);
     if (activeTab === 'anomalies') renderAnomalies(d);
@@ -416,6 +422,139 @@
     }
     const esc = escapeHtml(d.text);
     ui.textView.innerHTML = esc.replace(/␠\[[^\]]*\]/g, (m) => '<span class="gapmark">' + m + '</span>');
+  }
+
+  // ---- 限定版 HTTP/1.1 报文视图（直接读取冻结快照内的 d.http）----
+  function pktRangeText(set) {
+    if (!set.length) return '（无）';
+    // 连续包号压缩为区间显示
+    const sorted = set.slice().sort((a, b) => a - b);
+    const parts = [];
+    let s = sorted[0], e = sorted[0];
+    for (let i = 1; i <= sorted.length; i++) {
+      if (i < sorted.length && sorted[i] === e + 1) { e = sorted[i]; continue; }
+      parts.push(s === e ? '#' + (s + 1) : '#' + (s + 1) + '–#' + (e + 1));
+      if (i < sorted.length) { s = sorted[i]; e = sorted[i]; }
+    }
+    return parts.join('、');
+  }
+
+  /** 从冻结快照的 run 字节（普通数组）取出 [start,end) 展开区间的可见内容预览。 */
+  function bytesPreview(d, start, end, max) {
+    let bytes = [];
+    for (const run of d.runs) {
+      if (run.end <= start || run.start >= end) continue;
+      const lo = Math.max(0, start - run.start);
+      const hi = Math.min(run.bytes.length, end - run.start);
+      for (let i = lo; i < hi; i++) bytes.push(run.bytes[i]);
+    }
+    const limit = max || 200;
+    const truncated = bytes.length > limit;
+    bytes = bytes.slice(0, limit);
+    let ascii = '';
+    for (const b of bytes) ascii += b >= 32 && b < 127 ? String.fromCharCode(b) : '·';
+    return {
+      ascii: escapeHtml(ascii) + (truncated ? ' …（仅预览前 ' + limit + ' 字节，完整字节见十六进制视图/导出）' : '')
+    };
+  }
+
+  function renderHttp(d) {
+    const http = d.http || { messages: [], notices: [] };
+    const out = [];
+
+    if (http.notices && http.notices.length) {
+      out.push('<div class="http-notices">');
+      for (const n of http.notices) {
+        out.push(
+          '<div class="http-notice"><span class="tag snap">' +
+          (n.type === 'skipped_prefix' ? '再同步跳过' : '未解析尾部') + '</span> ' +
+          escapeHtml(n.message) + '</div>'
+        );
+      }
+      out.push('</div>');
+    }
+
+    if (!http.messages.length) {
+      out.push('<div class="empty">连续且无冲突的已覆盖字节中没有识别到 HTTP/1.1 起始线（或仅有跨缺口/截断候选，已按未完成处理或不展示）。</div>');
+      ui.httpView.innerHTML = out.join('');
+      return;
+    }
+
+    for (const m of http.messages) {
+      const cls = m.status === 'complete' ? 'ok' : m.status === 'unsupported' ? 'warn' : 'err';
+      const label =
+        m.status === 'complete' ? '完整' : m.status === 'unsupported' ? '不支持' : '未完成';
+      out.push('<div class="http-card ' + cls + '">');
+      out.push(
+        '<div class="http-head"><span class="http-status ' + cls + '">' + label + '</span>' +
+        '<span class="http-kind">' + (m.kind === 'request' ? '请求' : m.kind === 'response' ? '响应' : '（起始线未确认）') + '</span>' +
+        '<span class="muted">报文 ' + m.index + '</span></div>'
+      );
+
+      if (m.startLine) {
+        out.push('<div class="http-line">' + escapeHtml(m.startLine.text) + '</div>');
+      } else {
+        out.push('<div class="http-line muted">起始线未完整捕获，无法引用合法起始行。</div>');
+      }
+
+      if (m.headers) {
+        if (m.headers.length) {
+          out.push('<div class="http-headers">' +
+            m.headers.map((h) => escapeHtml(h.name + ': ' + h.value)).join('<br>') + '</div>');
+        }
+      } else {
+        out.push('<div class="muted">头部未完整捕获。</div>');
+      }
+
+      // 字节区间与包号证据（取证核心：明确“内容确实来自哪些包”）
+      out.push('<div class="http-ev">');
+      out.push(
+        '<div>该方向流字节区间：<code>[' + m.relStart + ', ' + m.relEnd + ')</code>' +
+        '（连续覆盖段内 ' + m.presentBytes + ' 字节）</div>'
+      );
+      if (m.bodyLengthExpected != null) {
+        out.push(
+          '<div>Content-Length 声明正文 ' + m.bodyLengthExpected + ' 字节，连续区内实际可见 ' +
+          (m.bodyLengthPresent || 0) + ' 字节。</div>'
+        );
+      }
+      if (m.gap) {
+        out.push('<div class="http-gap">越过缺口 [' + m.gap.relStart + ', ' + m.gap.relEnd +
+          ')（' + m.gap.length + ' 字节）：未读取缺口另一侧任何字节。</div>');
+      }
+      const spans = m.evidence.packets.map((p) =>
+        '<span class="ev-sep">包 <b>#' + p.pktNumber + '</b> 字节 [' +
+        (p.start + d.relBase) + ', ' + (p.end + d.relBase) + ')（' + p.bytes + 'B）</span>'
+      );
+      out.push('<div class="ev-line">逐字节来源包（首见归属）：' + spans.join('<span class="ev-join">→</span>') + '</div>');
+      if (m.evidence.retransmitPackets.length) {
+        out.push('<div class="muted">相同字节重传旁证（未改变内容）：' +
+          pktRangeText(m.evidence.retransmitPackets) + '</div>');
+      }
+      if (m.conflicts.length) {
+        out.push('<div class="http-conflict">区间内冲突位置 ' + m.conflicts.length +
+          ' 个，字节事实不唯一；冲突详情见“冲突”面板。</div>');
+      }
+      out.push('</div>');
+
+      if (m.status === 'complete' && m.bodyLengthPresent > 0 && m.bodyStart != null) {
+        const pv = bytesPreview(d, m.bodyStart, m.bodyEnd);
+        out.push('<div class="http-body-label">消息体（仅在完整且长度明确时预览，' +
+          m.bodyLengthPresent + ' 字节）：</div>');
+        out.push('<pre class="http-body">' + pv.ascii + '</pre>');
+      }
+      if (m.status !== 'complete' && m.reason) {
+        out.push('<div class="http-reason"><span class="tag conflict">' +
+          escapeHtml(m.reasonCode || '') + '</span> ' + escapeHtml(m.reason) + '</div>');
+      }
+      out.push('</div>');
+    }
+
+    out.push('<div class="http-foot muted">说明：仅在单方向、同一会话内连续且无冲突的字节上识别；' +
+      '跨缺口/冲突/截断/长度不完整的候选一律标为未完成；分块编码等不支持格式仅标记，不猜测正文边界；' +
+      '同四元组的后续会话独立识别，不续接前一会话残余。</div>');
+
+    ui.httpView.innerHTML = out.join('');
   }
 
   function renderAnomalies(d) {

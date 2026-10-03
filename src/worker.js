@@ -11,7 +11,7 @@
 'use strict';
 
 try {
-  importScripts('pcap.js', 'reassemble.js');
+  importScripts('pcap.js', 'http.js', 'reassemble.js');
 } catch (e) {
   // importScripts 路径错误时给出明确错误，而不是静默失败。
   self.postMessage({
@@ -46,15 +46,16 @@ self.onmessage = function (ev) {
     const parsed = self.PcapLib.parse(bytes, { maxPackets: maxPackets || 2000 });
     const model = self.ReassemblyLib.buildModel(parsed, bytes);
 
-    // 解析一完成即冻结；导出引用的是这份快照，不会随后续操作变化。
+    // 解析一完成即冻结；页面选中项、JSON 导出都只引用这一份不可变快照
+    // （model 不再单独回传，杜绝“实时模型与冻结快照两份不一致”的可能）。
     const snapshot = self.ReassemblyLib.freezeModel(model, {
       fileName: fileName || '(未命名)',
       fileSize: fileSize != null ? fileSize : bytes.byteLength,
       parsedAt: new Date().toISOString()
     });
 
-    // model 里的 run.bytes 是 Uint8Array 视图，可结构化克隆直接回传。
-    self.postMessage({ type: 'result', token, ok: true, model, snapshot });
+    // 冻结快照中的 run.bytes / owners 已展开为普通数组，可结构化克隆直接回传。
+    self.postMessage({ type: 'result', token, ok: true, snapshot });
   } catch (err) {
     const isFatal = !!(err && err.fatal);
     self.postMessage({

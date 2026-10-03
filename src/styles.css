@@ -189,6 +189,59 @@ body {
   margin-bottom: 10px;
   background: var(--panel2);
 }
+
+/* ---- 限定版 HTTP/1.1 报文视图 ---- */
+.http-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--panel2);
+}
+.http-card.ok { border-left-color: var(--ok); }
+.http-card.err { border-left-color: var(--err); }
+.http-card.warn { border-left-color: var(--warn); }
+.http-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.http-status {
+  display: inline-block; padding: 1px 10px; border-radius: 10px; font-size: 11px; font-weight: 600;
+}
+.http-status.ok { background: rgba(76,195,138,.18); color: var(--ok); }
+.http-status.err { background: rgba(229,96,77,.18); color: var(--err); }
+.http-status.warn { background: rgba(224,163,64,.18); color: var(--warn); }
+.http-kind { color: var(--muted); font-size: 12px; }
+.http-line {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 13px; margin: 2px 0 6px;
+}
+.http-headers {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px; color: var(--text);
+  border-top: 1px dashed var(--border); padding-top: 6px;
+}
+.http-ev { margin: 8px 0; font-size: 12px; line-height: 1.7; }
+.http-ev code { color: var(--accent); }
+.ev-line { margin-top: 2px; }
+.ev-sep b { color: var(--text); }
+.ev-join { color: var(--muted); margin: 0 4px; }
+.http-gap { color: var(--gap); }
+.http-conflict { color: var(--conflict); }
+.http-body-label { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.http-body {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px; margin: 4px 0 0; max-height: 240px; overflow: auto;
+}
+.http-reason { margin-top: 8px; font-size: 12px; color: var(--err); }
+.http-card.warn .http-reason { color: var(--warn); }
+.http-notices { margin-bottom: 10px; }
+.http-notice {
+  border: 1px solid rgba(224,163,64,.35); background: rgba(224,163,64,.08);
+  border-radius: 6px; padding: 6px 10px; margin-bottom: 6px; font-size: 12px;
+}
+.http-foot { margin-top: 10px; font-size: 12px; line-height: 1.7; }
+
 .gap-card .pos { color: var(--gap); font-family: ui-monospace, Menlo, monospace; }
 .conflict-card .pos { color: var(--conflict); font-family: ui-monospace, Menlo, monospace; }
 .bytes-line { font-family: ui-monospace, Menlo, monospace; margin-top: 4px; }
